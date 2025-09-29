@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 import os
 import json
+import tempfile
 import logging
 from datetime import datetime, timedelta
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 import openpyxl
 from apscheduler.schedulers.background import BackgroundScheduler
-import asyncio
 
 # ---------------- CONFIG ----------------
 API_ID = int(os.getenv("API_ID", ""))
@@ -21,18 +21,18 @@ CREDIT = "\n\n🤖 Powered by @captainpapaji"
 # ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+# ---------------- SESSION FILE HANDLING ----------------
+SESSION_NAME = "file_bot.session"
+if os.path.exists(SESSION_NAME):
+    logging.info("Deleting old session to avoid sync errors...")
+    os.remove(SESSION_NAME)
+
 # ---------------- APP ----------------
-app = Client(
-    "file_bot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN,
-    in_memory=True  # Important: avoids creating local session files
-)
+app = Client(SESSION_NAME, api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 # ---------------- STATE ----------------
-user_sessions = {}   # per-user state
-trial_uses = {}      # in-memory trial count
+user_sessions = {}
+trial_uses = {}
 daily_stats = {"new_users": set(), "files_processed": 0, "features": {"split":0,"merge":0,"xlsx_txt":0,"xlsx_msg":0,"txt_xlsx":0}}
 
 # ---------------- SUBSCRIPTION HELPERS ----------------
@@ -117,93 +117,6 @@ async def notify_owner_text(text):
     except Exception as e:
         logging.error(f"notify_owner_text failed: {e}")
 
-# ---------------- FILE HELPERS ----------------
-def clean_lines(lines):
-    seen = set()
-    out = []
-    for line in lines:
-        s = line.strip()
-        if s and s not in seen:
-            seen.add(s)
-            out.append(s)
-    return out
-
-def save_lines_to_txt(lines, path):
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
-
-def save_lines_to_xlsx(lines, path):
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    for i, v in enumerate(lines, start=1):
-        ws.cell(row=i, column=1, value=v)
-    wb.save(path)
-
-# ---------------- COMMANDS ----------------
-@app.on_message(filters.command("start"))
-async def start(client: Client, message: Message):
-    uid = message.from_user.id
-    if not is_subscribed(uid) and not is_trial_allowed(uid):
-        await message.reply(unsub_msg())
-        return
-    user_sessions[uid] = {}
-    daily_stats["new_users"].add(uid)
-    await message.reply("👋 Welcome! Choose an option:" + CREDIT, reply_markup=main_menu())
-
-@app.on_message(filters.command("checksub"))
-async def check_sub(client: Client, message: Message):
-    await message.reply(sub_status(message.from_user.id))
-
-@app.on_message(filters.command("plans"))
-async def plans(client: Client, message: Message):
-    await message.reply(unsub_msg())
-
-@app.on_message(filters.command("addsub") & filters.user(ADMIN_ID))
-async def add_sub_cmd(client: Client, message: Message):
-    try:
-        _, uid, days = message.text.split()
-        add_sub(int(uid), int(days))
-        await message.reply("✅ Subscription added." + CREDIT)
-    except:
-        await message.reply("❌ Usage: /addsub <user_id> <days>" + CREDIT)
-
-@app.on_message(filters.command("extend") & filters.user(ADMIN_ID))
-async def extend_sub_cmd(client: Client, message: Message):
-    try:
-        _, uid, days = message.text.split()
-        add_sub(int(uid), int(days))
-        await message.reply("✅ Subscription extended." + CREDIT)
-    except:
-        await message.reply("❌ Usage: /extend <user_id> <days>" + CREDIT)
-
-@app.on_message(filters.command("removesub") & filters.user(ADMIN_ID))
-async def remove_sub_cmd(client: Client, message: Message):
-    try:
-        _, uid = message.text.split()
-        remove_sub(int(uid))
-        await message.reply("🗑️ Subscription removed." + CREDIT)
-    except:
-        await message.reply("❌ Usage: /removesub <user_id>" + CREDIT)
-
-@app.on_message(filters.command("listsubs") & filters.user(ADMIN_ID))
-async def list_subs(client: Client, message: Message):
-    subs = load_subs()
-    if not subs:
-        return await message.reply("📭 No active subscriptions." + CREDIT)
-    msg = "👥 Active Subscribers:\n\n"
-    sorted_subs = sorted(subs.items(), key=lambda x: x[1]["expires"])
-    for uid, info in sorted_subs:
-        try:
-            user = await app.get_users(int(uid))
-            name = f"{user.first_name or ''} {user.last_name or ''}".strip()
-            username = f"@{user.username}" if user.username else ""
-        except:
-            name = "Unknown"
-            username = ""
-        msg += f"👤 {name} {username} ({uid}) | {info['plan']} | Expires: {info['expires']}\n"
-    msg += f"\n📊 Total Subscribers: {len(subs)}" + CREDIT
-    await message.reply(msg)
-
 # ---------------- DAILY SUMMARY ----------------
 def daily_summary():
     total_users = len(load_subs())
@@ -229,10 +142,9 @@ def daily_summary():
               f"- XLSX → Msg: {features['xlsx_msg']}\n" \
               f"- TXT → XLSX: {features['txt_xlsx']}\n\n" \
               f"⏳ Expiring Subscriptions:\n" + ("\n".join(expiring_subs) if expiring_subs else "None")
-    
-    # send to admin asynchronously
+    # send to admin
+    import asyncio
     asyncio.get_event_loop().create_task(notify_owner_text(summary))
-    
     # reset daily stats
     daily_stats["new_users"].clear()
     daily_stats["files_processed"] = 0
@@ -241,5 +153,10 @@ def daily_summary():
 
 # APScheduler
 scheduler = BackgroundScheduler()
-scheduler.add_job(daily_summary, 'cron', hour=0, minute=0)  # UTC midnight
+scheduler.add_job(daily_summary, 'cron', hour=0, minute=0)  # midnight
 scheduler.start()
+
+# ---------------- START BOT ----------------
+if __name__ == "__main__":
+    print("Bot is starting...")
+    app.run()
