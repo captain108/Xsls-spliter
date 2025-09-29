@@ -22,7 +22,7 @@ CREDIT = "\n\n🤖 Powered by @captainpapaji"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # ---------------- APP ----------------
-app = Client("file_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client("file_bot_cap", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 # ---------------- STATE ----------------
 user_sessions = {}   # per-user state
