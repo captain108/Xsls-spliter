@@ -1,56 +1,43 @@
-#!/usr/bin/env python3
+# bot.py
 import os
 import json
-import logging
-from datetime import datetime, timedelta
 import asyncio
-import openpyxl
-from pyrogram import Client, filters
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
-from apscheduler.schedulers.background import BackgroundScheduler
+from threading import Thread
 from flask import Flask
-import threading
+from pyrogram import Client, filters
+from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton
+from apscheduler.schedulers.background import BackgroundScheduler
+import xlsxwriter
 
-# ---------------- CONFIG ----------------
-API_ID = int(os.getenv("API_ID", ""))
-API_HASH = os.getenv("API_HASH", "")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-ADMIN_ID = int(os.getenv("ADMIN_ID", ""))
-SUB_FILE = os.getenv("SUB_FILE", "subscriptions.json")
-TRIAL_LIMIT = int(os.getenv("TRIAL_LIMIT", "2"))
-CREDIT = "\n\n🤖 Powered by @captainpapaji"
-FLASK_PORT = int(os.getenv("PORT", 8000))
-SESSION_NAME = "file_bot_new.session"
+# ----------------------------
+# CONFIG
+# ----------------------------
+API_ID = int(os.environ.get("API_ID"))
+API_HASH = os.environ.get("API_HASH")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+ADMIN_ID = int(os.environ.get("ADMIN_ID"))
 
-# ---------------- LOGGING ----------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+SUB_FILE = "subs.json"
+TRIAL_LIMIT = 2
+trial_uses = {}
 
-# ---------------- RESET SESSION ----------------
-if os.path.exists(SESSION_NAME):
-    logging.info("Deleting old session to avoid sync errors...")
-    os.remove(SESSION_NAME)
+daily_stats = {"new_users": set(), "files_processed": 0, "features": {"split":0,"merge":0,"xlsx_txt":0,"xlsx_msg":0,"txt_xlsx":0}}
 
-# ---------------- INIT ----------------
-app = Client(SESSION_NAME, api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-flask_app = Flask(__name__)
+# ----------------------------
+# CLIENT
+# ----------------------------
+if not os.path.exists("file_bot.session"):
+    app = Client("file_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+else:
+    app = Client("file_bot")
 
-# ---------------- STATE ----------------
-user_sessions = {}  # per-user state
-trial_uses = {}     # in-memory trial count
-daily_stats = {
-    "new_users": set(),
-    "files_processed": 0,
-    "features": {"split":0,"xlsx_txt":0,"xlsx_msg":0,"txt_xlsx":0}
-}
-
-# ---------------- SUBSCRIPTION ----------------
+# ----------------------------
+# SUBS HELPERS
+# ----------------------------
 def load_subs():
     if os.path.exists(SUB_FILE):
-        try:
-            with open(SUB_FILE, "r") as f:
-                return json.load(f)
-        except:
-            return {}
+        with open(SUB_FILE, "r") as f:
+            return json.load(f)
     return {}
 
 def save_subs(data):
@@ -59,238 +46,194 @@ def save_subs(data):
 
 def is_subscribed(uid):
     subs = load_subs()
-    entry = subs.get(str(uid))
-    if not entry:
-        return False
-    try:
-        exp = datetime.strptime(entry["expires"], "%Y-%m-%d %H:%M:%S")
-        return datetime.now() < exp
-    except:
-        return False
+    return str(uid) in subs
 
-def add_sub(uid, days, plan="pro"):
+def is_trial_allowed(uid):
+    return trial_uses.get(uid, 0) < TRIAL_LIMIT
+
+def use_trial(uid):
+    trial_uses[uid] = trial_uses.get(uid, 0) + 1
+
+def add_sub(uid, days=30, plan="pro"):
     subs = load_subs()
-    expiry = datetime.now() + timedelta(days=days)
-    subs[str(uid)] = {"expires": expiry.strftime("%Y-%m-%d %H:%M:%S"), "plan": plan}
+    subs[str(uid)] = {"plan": plan, "days": days}
     save_subs(subs)
 
 def remove_sub(uid):
     subs = load_subs()
-    if str(uid) in subs:
-        del subs[str(uid)]
-        save_subs(subs)
+    subs.pop(str(uid), None)
+    save_subs(subs)
 
 def sub_status(uid):
-    subs = load_subs()
-    entry = subs.get(str(uid))
-    if not entry:
-        return "❌ No active subscription." + CREDIT
-    expiry = datetime.strptime(entry["expires"], "%Y-%m-%d %H:%M:%S")
-    remaining = expiry - datetime.now()
-    return f"✅ Plan: {entry['plan']}\n⏳ Expires in {remaining.days} days" + CREDIT
+    if is_subscribed(uid):
+        subs = load_subs()
+        return subs.get(str(uid))
+    return None
 
-def is_trial_allowed(uid):
-    return trial_uses.get(str(uid), 0) < TRIAL_LIMIT
-
-def use_trial(uid):
-    trial_uses[str(uid)] = trial_uses.get(str(uid), 0) + 1
-
-def unsub_msg():
-    return (
-        "❌ You're not subscribed or your subscription has expired.\n\n"
-        "📦 Subscription Plans:\n"
-        "🗓 1 Day – ₹30\n"
-        "📅 1 Week – ₹180\n"
-        "📆 1 Year – ₹1500\n\n"
-        "💬 Contact @captainpapaji to activate." + CREDIT
-    )
-
-# ---------------- UI ----------------
-def main_menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📤 Split TXT File", callback_data="split_txt")],
-        [InlineKeyboardButton("📄 XLSX → TXT", callback_data="xlsx_to_txt")],
-        [InlineKeyboardButton("💬 XLSX → Message List", callback_data="xlsx_to_msg")],
-        [InlineKeyboardButton("📊 TXT → XLSX", callback_data="txt_to_xlsx")]
-    ])
-
-def back_btn():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back")]])
-
-# ---------------- NOTIFICATIONS ----------------
-async def notify_owner_text(text):
-    try:
-        await app.send_message(chat_id=ADMIN_ID, text=text)
-    except Exception as e:
-        logging.error(f"notify_owner_text failed: {e}")
-
-# ---------------- FILE HELPERS ----------------
+# ----------------------------
+# FILE HELPERS
+# ----------------------------
 def clean_lines(lines):
-    seen = set()
-    out = []
-    for line in lines:
-        s = line.strip()
-        if s and s not in seen:
-            seen.add(s)
-            out.append(s)
-    return out
+    return list(dict.fromkeys([line.strip() for line in lines if line.strip()]))
 
 def save_lines_to_txt(lines, path):
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
 def save_lines_to_xlsx(lines, path):
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    for i, v in enumerate(lines, start=1):
-        ws.cell(row=i, column=1, value=v)
-    wb.save(path)
+    wb = xlsxwriter.Workbook(path)
+    ws = wb.add_worksheet()
+    for i, line in enumerate(lines):
+        ws.write(i, 0, line)
+    wb.close()
 
-# ---------------- DAILY SUMMARY ----------------
-def daily_summary():
-    total_users = len(load_subs())
-    new_today = len(daily_stats["new_users"])
-    files_processed = daily_stats["files_processed"]
-    features = daily_stats["features"]
+# ----------------------------
+# UI HELPERS
+# ----------------------------
+def main_menu():
+    buttons = [[KeyboardButton("📤 Upload File")],
+               [KeyboardButton("📊 Check Stats"), KeyboardButton("⚙️ Plans")]]
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
-    expiring_subs = []
-    subs = load_subs()
-    for uid, info in subs.items():
-        exp = datetime.strptime(info["expires"], "%Y-%m-%d %H:%M:%S")
-        if 0 <= (exp - datetime.now()).days <= 3:
-            expiring_subs.append(f"{uid} → { (exp - datetime.now()).days } days left")
+def back_btn():
+    return ReplyKeyboardMarkup([[KeyboardButton("🔙 Back")]], resize_keyboard=True)
 
-    summary = f"📊 Daily Bot Summary – {datetime.now().strftime('%d %b %Y')}\n\n" \
-              f"👥 Total users: {total_users}\n" \
-              f"🆕 New users today: {new_today}\n" \
-              f"📂 Files processed: {files_processed}\n\n" \
-              f"🔥 Feature usage today:\n" \
-              f"- Split TXT: {features['split']}\n" \
-              f"- XLSX → TXT: {features['xlsx_txt']}\n" \
-              f"- XLSX → Msg: {features['xlsx_msg']}\n" \
-              f"- TXT → XLSX: {features['txt_xlsx']}\n\n" \
-              f"⏳ Expiring Subscriptions:\n" + ("\n".join(expiring_subs) if expiring_subs else "None")
-    asyncio.get_event_loop().create_task(notify_owner_text(summary))
-    # reset daily stats
-    daily_stats["new_users"].clear()
-    daily_stats["files_processed"] = 0
-    for k in daily_stats["features"]:
-        daily_stats["features"][k] = 0
-
-# ---------------- APScheduler ----------------
-scheduler = BackgroundScheduler()
-scheduler.add_job(daily_summary, 'cron', hour=0, minute=0)  # midnight
-scheduler.start()
-
-# ---------------- BOT COMMANDS ----------------
+# ----------------------------
+# COMMANDS
+# ----------------------------
 @app.on_message(filters.command("start"))
-async def start(client: Client, message: Message):
+async def start(client, message):
     uid = message.from_user.id
     if not is_subscribed(uid) and not is_trial_allowed(uid):
-        await message.reply(unsub_msg())
+        await message.reply("❌ Trial ended. Subscribe to continue.")
         return
-    user_sessions[uid] = {}
+    if not is_subscribed(uid):
+        use_trial(uid)
     daily_stats["new_users"].add(uid)
-    await message.reply("👋 Welcome! Choose an option:" + CREDIT, reply_markup=main_menu())
+    await message.reply("👋 Welcome!", reply_markup=main_menu())
 
 @app.on_message(filters.command("checksub"))
-async def check_sub(client: Client, message: Message):
-    await message.reply(sub_status(message.from_user.id))
+async def check_sub(client, message):
+    uid = message.from_user.id
+    if is_subscribed(uid):
+        status = sub_status(uid)
+        await message.reply(f"✅ Subscribed ({status['plan']} plan, {status['days']} days left)")
+    else:
+        await message.reply(f"❌ Not subscribed. Trial remaining: {TRIAL_LIMIT - trial_uses.get(uid,0)}")
 
 @app.on_message(filters.command("plans"))
-async def plans(client: Client, message: Message):
-    await message.reply(unsub_msg())
+async def plans(client, message):
+    await message.reply("💳 Available plans:\n- Pro: 30 days\n- Premium: 90 days")
 
 @app.on_message(filters.command("addsub") & filters.user(ADMIN_ID))
-async def add_sub_cmd(client: Client, message: Message):
+async def add_sub_cmd(client, message):
     try:
-        _, uid, days = message.text.split()
-        add_sub(int(uid), int(days))
-        await message.reply("✅ Subscription added." + CREDIT)
+        uid = message.text.split()[1]
+        add_sub(uid)
+        await message.reply(f"✅ Subscription added for {uid}")
     except:
-        await message.reply("❌ Usage: /addsub <user_id> <days>" + CREDIT)
+        await message.reply("Usage: /addsub <user_id>")
 
 @app.on_message(filters.command("extend") & filters.user(ADMIN_ID))
-async def extend_sub_cmd(client: Client, message: Message):
+async def extend_sub_cmd(client, message):
     try:
-        _, uid, days = message.text.split()
-        add_sub(int(uid), int(days))
-        await message.reply("✅ Subscription extended." + CREDIT)
+        parts = message.text.split()
+        uid = parts[1]
+        days = int(parts[2])
+        subs = load_subs()
+        if uid in subs:
+            subs[uid]["days"] += days
+            save_subs(subs)
+            await message.reply(f"✅ Extended {uid} by {days} days")
+        else:
+            await message.reply("❌ User not subscribed")
     except:
-        await message.reply("❌ Usage: /extend <user_id> <days>" + CREDIT)
+        await message.reply("Usage: /extend <user_id> <days>")
 
 @app.on_message(filters.command("removesub") & filters.user(ADMIN_ID))
-async def remove_sub_cmd(client: Client, message: Message):
+async def remove_sub_cmd(client, message):
     try:
-        _, uid = message.text.split()
-        remove_sub(int(uid))
-        await message.reply("🗑️ Subscription removed." + CREDIT)
+        uid = message.text.split()[1]
+        remove_sub(uid)
+        await message.reply(f"✅ Removed subscription for {uid}")
     except:
-        await message.reply("❌ Usage: /removesub <user_id>" + CREDIT)
+        await message.reply("Usage: /removesub <user_id>")
 
 @app.on_message(filters.command("listsubs") & filters.user(ADMIN_ID))
-async def list_subs(client: Client, message: Message):
+async def list_subs(client, message):
     subs = load_subs()
     if not subs:
-        return await message.reply("📭 No active subscriptions." + CREDIT)
-    msg = "👥 Active Subscribers:\n\n"
-    sorted_subs = sorted(subs.items(), key=lambda x: x[1]["expires"])
-    for uid, info in sorted_subs:
-        try:
-            user = await app.get_users(int(uid))
-            name = f"{user.first_name or ''} {user.last_name or ''}".strip()
-            username = f"@{user.username}" if user.username else ""
-        except:
-            name = "Unknown"
-            username = ""
-        msg += f"👤 {name} {username} ({uid}) | {info['plan']} | Expires: {info['expires']}\n"
-    msg += f"\n📊 Total Subscribers: {len(subs)}" + CREDIT
-    await message.reply(msg)
-
-# ---------------- CALLBACK HANDLER ----------------
-@app.on_callback_query()
-async def cb_handler(client, cq):
-    uid = cq.from_user.id
-    data = cq.data
-    if data == "back":
-        await cq.message.edit_text("👋 Main Menu:" + CREDIT, reply_markup=main_menu())
+        await message.reply("❌ No active subscribers.")
         return
+    
+    msg_lines = ["📋 Active Subscribers:"]
+    for uid, info in subs.items():
+        plan = info.get("plan", "pro")
+        days = info.get("days", 0)
+        msg_lines.append(f"• User ID: {uid} — Plan: {plan}, Days Left: {days}")
+    
+    chunk_size = 4000
+    msg_text = ""
+    for line in msg_lines:
+        if len(msg_text) + len(line) + 1 > chunk_size:
+            await message.reply(msg_text)
+            msg_text = ""
+        msg_text += line + "\n"
+    if msg_text:
+        await message.reply(msg_text)
 
+# ----------------------------
+# FILE HANDLER
+# ----------------------------
+@app.on_message(filters.document)
+async def handle_file(client, message):
+    uid = message.from_user.id
     if not is_subscribed(uid) and not is_trial_allowed(uid):
-        await cq.message.edit_text(unsub_msg())
+        await message.reply("❌ Trial ended. Subscribe to continue.")
         return
+    if not is_subscribed(uid):
+        use_trial(uid)
 
-    session = user_sessions.setdefault(uid, {})
-    session["last_action"] = data
+    file_path = await message.download()
+    daily_stats["files_processed"] += 1
+    await message.reply(f"✅ File saved: {file_path}")
 
-    if data == "split_txt":
-        await cq.message.edit_text("📤 Send me the TXT file to split." + CREDIT, reply_markup=back_btn())
-        daily_stats["features"]["split"] += 1
-    elif data == "xlsx_to_txt":
-        await cq.message.edit_text("📄 Send me the XLSX file to convert to TXT." + CREDIT, reply_markup=back_btn())
-        daily_stats["features"]["xlsx_txt"] += 1
-    elif data == "xlsx_to_msg":
-        await cq.message.edit_text("💬 Send me the XLSX file to convert to message list." + CREDIT, reply_markup=back_btn())
-        daily_stats["features"]["xlsx_msg"] += 1
-    elif data == "txt_to_xlsx":
-        await cq.message.edit_text("📊 Send me the TXT file to convert to XLSX." + CREDIT, reply_markup=back_btn())
-        daily_stats["features"]["txt_xlsx"] += 1
+# ----------------------------
+# DAILY SUMMARY
+# ----------------------------
+def daily_summary():
+    try:
+        stats_msg = f"📊 Daily Summary:\n- New users: {len(daily_stats['new_users'])}\n- Files processed: {daily_stats['files_processed']}"
+        asyncio.run(app.send_message(ADMIN_ID, stats_msg))
+        daily_stats["new_users"].clear()
+        daily_stats["files_processed"] = 0
+        daily_stats["features"] = {k:0 for k in daily_stats["features"]}
+    except Exception as e:
+        print("Failed daily summary:", e)
 
-# ---------------- FLASK STATUS ----------------
+scheduler = BackgroundScheduler()
+scheduler.add_job(daily_summary, 'cron', hour=0, minute=0)
+scheduler.start()
+
+# ----------------------------
+# RUN BOT THREAD
+# ----------------------------
+def run_bot():
+    asyncio.run(app.start())
+    app.idle()
+
+bot_thread = Thread(target=run_bot)
+bot_thread.daemon = True
+bot_thread.start()
+
+# ----------------------------
+# FLASK HEALTH CHECK
+# ----------------------------
+flask_app = Flask(__name__)
+
 @flask_app.route("/")
 def status():
     return "Bot is running ✅"
 
-# ---------------- RUN BOTH ----------------
-def run_flask():
-    flask_app.run(host="0.0.0.0", port=FLASK_PORT)
-
-def run_bot():
-    print("Bot is starting...")
-    app.run()
-
 if __name__ == "__main__":
-    # Start Flask in background
-    threading.Thread(target=run_flask, daemon=True).start()
-    # Start bot
-    run_bot()
+    flask_app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
