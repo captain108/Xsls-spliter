@@ -3,11 +3,13 @@ import os
 import json
 import logging
 from datetime import datetime, timedelta
+import asyncio
+import openpyxl
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
-import openpyxl
 from apscheduler.schedulers.background import BackgroundScheduler
-import asyncio
+from flask import Flask
+import threading
 
 # ---------------- CONFIG ----------------
 API_ID = int(os.getenv("API_ID", ""))
@@ -17,25 +19,31 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", ""))
 SUB_FILE = os.getenv("SUB_FILE", "subscriptions.json")
 TRIAL_LIMIT = int(os.getenv("TRIAL_LIMIT", "2"))
 CREDIT = "\n\n🤖 Powered by @captainpapaji"
+FLASK_PORT = int(os.getenv("PORT", 8000))
+SESSION_NAME = "file_bot.session"
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# ---------------- SESSION FILE HANDLING ----------------
-SESSION_NAME = "file_bot.session"
+# ---------------- RESET SESSION ----------------
 if os.path.exists(SESSION_NAME):
     logging.info("Deleting old session to avoid sync errors...")
     os.remove(SESSION_NAME)
 
-# ---------------- APP ----------------
+# ---------------- INIT ----------------
 app = Client(SESSION_NAME, api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+flask_app = Flask(__name__)
 
 # ---------------- STATE ----------------
-user_sessions = {}
-trial_uses = {}
-daily_stats = {"new_users": set(), "files_processed": 0, "features": {"split":0,"xlsx_txt":0,"xlsx_msg":0,"txt_xlsx":0}}
+user_sessions = {}  # per-user state
+trial_uses = {}     # in-memory trial count
+daily_stats = {
+    "new_users": set(),
+    "files_processed": 0,
+    "features": {"split":0,"xlsx_txt":0,"xlsx_msg":0,"txt_xlsx":0}
+}
 
-# ---------------- SUBSCRIPTION HELPERS ----------------
+# ---------------- SUBSCRIPTION ----------------
 def load_subs():
     if os.path.exists(SUB_FILE):
         try:
@@ -109,7 +117,7 @@ def main_menu():
 def back_btn():
     return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back")]])
 
-# ---------------- OWNER/ADMIN NOTIFICATIONS ----------------
+# ---------------- NOTIFICATIONS ----------------
 async def notify_owner_text(text):
     try:
         await app.send_message(chat_id=ADMIN_ID, text=text)
@@ -138,12 +146,43 @@ def save_lines_to_xlsx(lines, path):
         ws.cell(row=i, column=1, value=v)
     wb.save(path)
 
-def xlsx_to_msg_list(path):
-    wb = openpyxl.load_workbook(path)
-    ws = wb.active
-    return [str(cell.value) for cell in ws['A'] if cell.value]
+# ---------------- DAILY SUMMARY ----------------
+def daily_summary():
+    total_users = len(load_subs())
+    new_today = len(daily_stats["new_users"])
+    files_processed = daily_stats["files_processed"]
+    features = daily_stats["features"]
 
-# ---------------- COMMANDS ----------------
+    expiring_subs = []
+    subs = load_subs()
+    for uid, info in subs.items():
+        exp = datetime.strptime(info["expires"], "%Y-%m-%d %H:%M:%S")
+        if 0 <= (exp - datetime.now()).days <= 3:
+            expiring_subs.append(f"{uid} → { (exp - datetime.now()).days } days left")
+
+    summary = f"📊 Daily Bot Summary – {datetime.now().strftime('%d %b %Y')}\n\n" \
+              f"👥 Total users: {total_users}\n" \
+              f"🆕 New users today: {new_today}\n" \
+              f"📂 Files processed: {files_processed}\n\n" \
+              f"🔥 Feature usage today:\n" \
+              f"- Split TXT: {features['split']}\n" \
+              f"- XLSX → TXT: {features['xlsx_txt']}\n" \
+              f"- XLSX → Msg: {features['xlsx_msg']}\n" \
+              f"- TXT → XLSX: {features['txt_xlsx']}\n\n" \
+              f"⏳ Expiring Subscriptions:\n" + ("\n".join(expiring_subs) if expiring_subs else "None")
+    asyncio.get_event_loop().create_task(notify_owner_text(summary))
+    # reset daily stats
+    daily_stats["new_users"].clear()
+    daily_stats["files_processed"] = 0
+    for k in daily_stats["features"]:
+        daily_stats["features"][k] = 0
+
+# ---------------- APScheduler ----------------
+scheduler = BackgroundScheduler()
+scheduler.add_job(daily_summary, 'cron', hour=0, minute=0)  # midnight
+scheduler.start()
+
+# ---------------- BOT COMMANDS ----------------
 @app.on_message(filters.command("start"))
 async def start(client: Client, message: Message):
     uid = message.from_user.id
@@ -152,18 +191,7 @@ async def start(client: Client, message: Message):
         return
     user_sessions[uid] = {}
     daily_stats["new_users"].add(uid)
-    await message.reply(
-        "👋 Welcome! Choose an option:" + CREDIT +
-        "\n\nCommands:\n"
-        "/start - Show this menu\n"
-        "/checksub - Check your subscription\n"
-        "/plans - Show subscription plans\n"
-        "/addsub - Admin add subscription\n"
-        "/extend - Admin extend subscription\n"
-        "/removesub - Admin remove subscription\n"
-        "/listsubs - Admin list all subscribers",
-        reply_markup=main_menu()
-    )
+    await message.reply("👋 Welcome! Choose an option:" + CREDIT, reply_markup=main_menu())
 
 @app.on_message(filters.command("checksub"))
 async def check_sub(client: Client, message: Message):
@@ -247,47 +275,22 @@ async def cb_handler(client, cq):
     elif data == "txt_to_xlsx":
         await cq.message.edit_text("📊 Send me the TXT file to convert to XLSX." + CREDIT, reply_markup=back_btn())
         daily_stats["features"]["txt_xlsx"] += 1
-    else:
-        await cq.answer("⚠️ Unknown action.")
 
-# ---------------- DAILY SUMMARY ----------------
-def daily_summary():
-    total_users = len(load_subs())
-    new_today = len(daily_stats["new_users"])
-    files_processed = daily_stats["files_processed"]
-    features = daily_stats["features"]
+# ---------------- FLASK STATUS ----------------
+@flask_app.route("/")
+def status():
+    return "Bot is running ✅"
 
-    expiring_subs = []
-    subs = load_subs()
-    for uid, info in subs.items():
-        exp = datetime.strptime(info["expires"], "%Y-%m-%d %H:%M:%S")
-        if 0 <= (exp - datetime.now()).days <= 3:
-            expiring_subs.append(f"{uid} → { (exp - datetime.now()).days } days left")
+# ---------------- RUN BOTH ----------------
+def run_flask():
+    flask_app.run(host="0.0.0.0", port=FLASK_PORT)
 
-    summary = f"📊 Daily Bot Summary – {datetime.now().strftime('%d %b %Y')}\n\n" \
-              f"👥 Total users: {total_users}\n" \
-              f"🆕 New users today: {new_today}\n" \
-              f"📂 Files processed: {files_processed}\n\n" \
-              f"🔥 Feature usage today:\n" \
-              f"- Split TXT: {features['split']}\n" \
-              f"- XLSX → TXT: {features['xlsx_txt']}\n" \
-              f"- XLSX → Msg: {features['xlsx_msg']}\n" \
-              f"- TXT → XLSX: {features['txt_xlsx']}\n\n" \
-              f"⏳ Expiring Subscriptions:\n" + ("\n".join(expiring_subs) if expiring_subs else "None")
-    asyncio.get_event_loop().create_task(notify_owner_text(summary))
-
-    # Reset daily stats
-    daily_stats["new_users"].clear()
-    daily_stats["files_processed"] = 0
-    for k in daily_stats["features"]:
-        daily_stats["features"][k] = 0
-
-# APScheduler
-scheduler = BackgroundScheduler()
-scheduler.add_job(daily_summary, 'cron', hour=0, minute=0)  # midnight
-scheduler.start()
-
-# ---------------- START BOT ----------------
-if __name__ == "__main__":
+def run_bot():
     print("Bot is starting...")
     app.run()
+
+if __name__ == "__main__":
+    # Start Flask in background
+    threading.Thread(target=run_flask, daemon=True).start()
+    # Start bot
+    run_bot()
