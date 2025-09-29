@@ -10,10 +10,10 @@ import openpyxl
 from apscheduler.schedulers.background import BackgroundScheduler
 
 # ---------------- CONFIG ----------------
-API_ID = int(os.getenv("API_ID", "21845583"))
-API_HASH = os.getenv("API_HASH", "081a3cc51a428ad292be0be4d4f4f975")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "7863454586:AAHHe-yWzUTqPW9Wjn8YhDo2K_DyZblGQHg")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "7597393283"))
+API_ID = int(os.getenv("API_ID", ""))
+API_HASH = os.getenv("API_HASH", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+ADMIN_ID = int(os.getenv("ADMIN_ID", ""))
 SUB_FILE = os.getenv("SUB_FILE", "subscriptions.json")
 TRIAL_LIMIT = int(os.getenv("TRIAL_LIMIT", "2"))
 CREDIT = "\n\n🤖 Powered by @captainpapaji"
