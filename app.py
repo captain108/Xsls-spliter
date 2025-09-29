@@ -13,8 +13,8 @@ from apscheduler.schedulers.background import BackgroundScheduler
 API_ID = int(os.getenv("API_ID", "21845583"))
 API_HASH = os.getenv("API_HASH", "081a3cc51a428ad292be0be4d4f4f975")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "7863454586:AAHHe-yWzUTqPW9Wjn8YhDo2K_DyZblGQHg")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "7597393283"))  # owner/admin
-SUB_FILE = os.getenv("SUB_FILE", "subscriptions1.json")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "7597393283"))
+SUB_FILE = os.getenv("SUB_FILE", "subscriptions.json")
 TRIAL_LIMIT = int(os.getenv("TRIAL_LIMIT", "2"))
 CREDIT = "\n\n🤖 Powered by @captainpapaji"
 
@@ -22,7 +22,7 @@ CREDIT = "\n\n🤖 Powered by @captainpapaji"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # ---------------- APP ----------------
-app = Client("merged_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client("file_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 # ---------------- STATE ----------------
 user_sessions = {}   # per-user state
@@ -32,11 +32,11 @@ daily_stats = {"new_users": set(), "files_processed": 0, "features": {"split":0,
 # ---------------- SUBSCRIPTION HELPERS ----------------
 def load_subs():
     if os.path.exists(SUB_FILE):
-        with open(SUB_FILE, "r") as f:
-            try:
+        try:
+            with open(SUB_FILE, "r") as f:
                 return json.load(f)
-            except:
-                return {}
+        except:
+            return {}
     return {}
 
 def save_subs(data):
@@ -51,7 +51,7 @@ def is_subscribed(uid):
     try:
         exp = datetime.strptime(entry["expires"], "%Y-%m-%d %H:%M:%S")
         return datetime.now() < exp
-    except Exception:
+    except:
         return False
 
 def add_sub(uid, days, plan="pro"):
@@ -96,22 +96,22 @@ def main_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📤 Split TXT File", callback_data="split_txt")],
         [InlineKeyboardButton("📥 Merge TXT Files", callback_data="merge_txt")],
-        [InlineKeyboardButton("📄 XLSX → TXT", callback_data="xlsx_to_txt_menu")],
-        [InlineKeyboardButton("💬 XLSX → Message List", callback_data="xlsx_to_msg_menu")],
-        [InlineKeyboardButton("📊 TXT → XLSX", callback_data="txt_to_xlsx_menu")]
+        [InlineKeyboardButton("📄 XLSX → TXT", callback_data="xlsx_to_txt")],
+        [InlineKeyboardButton("💬 XLSX → Message List", callback_data="xlsx_to_msg")],
+        [InlineKeyboardButton("📊 TXT → XLSX", callback_data="txt_to_xlsx")]
     ])
 
 def back_btn():
     return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back")]])
 
 # ---------------- OWNER/ADMIN NOTIFICATIONS ----------------
-async def notify_owner_text(client, text):
+async def notify_owner_text(text):
     try:
-        await client.send_message(chat_id=ADMIN_ID, text=text)
+        await app.send_message(chat_id=ADMIN_ID, text=text)
     except Exception as e:
-        logging.error("notify_owner_text failed: %s", e)
+        logging.error(f"notify_owner_text failed: {e}")
 
-# ---------------- HELPERS ----------------
+# ---------------- FILE HELPERS ----------------
 def clean_lines(lines):
     seen = set()
     out = []
@@ -198,37 +198,46 @@ async def list_subs(client: Client, message: Message):
     msg += f"\n📊 Total Subscribers: {len(subs)}" + CREDIT
     await message.reply(msg)
 
-# ---------------- CALLBACKS ----------------
-@app.on_callback_query()
-async def handle_callback(client: Client, cb: CallbackQuery):
-    uid = cb.from_user.id
-    if not is_subscribed(uid):
-        if is_trial_allowed(uid):
-            use_trial(uid)
-        else:
-            await cb.message.reply(unsub_msg())
-            await cb.answer()
-            return
+# ---------------- DAILY SUMMARY ----------------
+def daily_summary():
+    total_users = len(load_subs())
+    new_today = len(daily_stats["new_users"])
+    files_processed = daily_stats["files_processed"]
+    features = daily_stats["features"]
 
-    data = cb.data
-    modes = {
-        "split_txt": "📤 Send the `.txt` file to split.",
-        "merge_txt": "🔢 How many `.txt` files to merge?",
-        "xlsx_to_txt_menu": "📥 Send the `.xlsx` file to convert to TXT.",
-        "xlsx_to_msg_menu": "📥 Send the `.xlsx` file to convert to message list.",
-        "txt_to_xlsx_menu": "📥 Send the `.txt` file to convert to XLSX."
-    }
+    expiring_subs = []
+    subs = load_subs()
+    for uid, info in subs.items():
+        exp = datetime.strptime(info["expires"], "%Y-%m-%d %H:%M:%S")
+        if 0 <= (exp - datetime.now()).days <= 3:
+            expiring_subs.append(f"{uid} → { (exp - datetime.now()).days } days left")
 
-    if data in modes:
-        mode_name = data.replace("_menu","")
-        user_sessions[uid] = {"mode": mode_name, "files":[]}
-        await cb.message.reply(modes[data]+CREDIT, reply_markup=back_btn())
+    summary = f"📊 Daily Bot Summary – {datetime.now().strftime('%d %b %Y')}\n\n" \
+              f"👥 Total users: {total_users}\n" \
+              f"🆕 New users today: {new_today}\n" \
+              f"📂 Files processed: {files_processed}\n\n" \
+              f"🔥 Feature usage today:\n" \
+              f"- Split TXT: {features['split']}\n" \
+              f"- Merge TXT: {features['merge']}\n" \
+              f"- XLSX → TXT: {features['xlsx_txt']}\n" \
+              f"- XLSX → Msg: {features['xlsx_msg']}\n" \
+              f"- TXT → XLSX: {features['txt_xlsx']}\n\n" \
+              f"⏳ Expiring Subscriptions:\n" + ("\n".join(expiring_subs) if expiring_subs else "None")
+    # send to admin
+    import asyncio
+    asyncio.get_event_loop().create_task(notify_owner_text(summary))
+    # reset daily stats
+    daily_stats["new_users"].clear()
+    daily_stats["files_processed"] = 0
+    for k in daily_stats["features"]:
+        daily_stats["features"][k] = 0
 
-    elif data == "back":
-        user_sessions[uid] = {}
-        await cb.message.reply("🔙 Back to main menu:" + CREDIT, reply_markup=main_menu())
+# APScheduler
+scheduler = BackgroundScheduler()
+scheduler.add_job(daily_summary, 'cron', hour=0, minute=0)  # midnight
+scheduler.start()
 
-    elif data in ["by_lines","by_files"]:
-        s = user_sessions.get(uid)
-        if not s or "txt_file" not in s:
-            await
+# ---------------- START BOT ----------------
+if __name__ == "__main__":
+    print("Bot is starting...")
+    app.run()
