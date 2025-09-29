@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 import os
 import json
-import tempfile
 import logging
 from datetime import datetime, timedelta
 from pyrogram import Client, filters
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 import openpyxl
 from apscheduler.schedulers.background import BackgroundScheduler
+import asyncio
 
 # ---------------- CONFIG ----------------
 API_ID = int(os.getenv("API_ID", ""))
@@ -22,7 +22,13 @@ CREDIT = "\n\n🤖 Powered by @captainpapaji"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # ---------------- APP ----------------
-app = Client("file_bot_cap", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client(
+    "file_bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
+    in_memory=True  # Important: avoids creating local session files
+)
 
 # ---------------- STATE ----------------
 user_sessions = {}   # per-user state
@@ -223,9 +229,10 @@ def daily_summary():
               f"- XLSX → Msg: {features['xlsx_msg']}\n" \
               f"- TXT → XLSX: {features['txt_xlsx']}\n\n" \
               f"⏳ Expiring Subscriptions:\n" + ("\n".join(expiring_subs) if expiring_subs else "None")
-    # send to admin
-    import asyncio
+    
+    # send to admin asynchronously
     asyncio.get_event_loop().create_task(notify_owner_text(summary))
+    
     # reset daily stats
     daily_stats["new_users"].clear()
     daily_stats["files_processed"] = 0
@@ -234,10 +241,5 @@ def daily_summary():
 
 # APScheduler
 scheduler = BackgroundScheduler()
-scheduler.add_job(daily_summary, 'cron', hour=0, minute=0)  # midnight
+scheduler.add_job(daily_summary, 'cron', hour=0, minute=0)  # UTC midnight
 scheduler.start()
-
-# ---------------- START BOT ----------------
-if __name__ == "__main__":
-    print("Bot is starting...")
-    app.run()
