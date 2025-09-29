@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 import os
 import json
-import tempfile
 import logging
 from datetime import datetime, timedelta
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 import openpyxl
 from apscheduler.schedulers.background import BackgroundScheduler
+import asyncio
 
 # ---------------- CONFIG ----------------
 API_ID = int(os.getenv("API_ID", ""))
@@ -33,7 +33,7 @@ app = Client(SESSION_NAME, api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN
 # ---------------- STATE ----------------
 user_sessions = {}
 trial_uses = {}
-daily_stats = {"new_users": set(), "files_processed": 0, "features": {"split":0,"merge":0,"xlsx_txt":0,"xlsx_msg":0,"txt_xlsx":0}}
+daily_stats = {"new_users": set(), "files_processed": 0, "features": {"split":0,"xlsx_txt":0,"xlsx_msg":0,"txt_xlsx":0}}
 
 # ---------------- SUBSCRIPTION HELPERS ----------------
 def load_subs():
@@ -101,7 +101,6 @@ def unsub_msg():
 def main_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📤 Split TXT File", callback_data="split_txt")],
-        [InlineKeyboardButton("📥 Merge TXT Files", callback_data="merge_txt")],
         [InlineKeyboardButton("📄 XLSX → TXT", callback_data="xlsx_to_txt")],
         [InlineKeyboardButton("💬 XLSX → Message List", callback_data="xlsx_to_msg")],
         [InlineKeyboardButton("📊 TXT → XLSX", callback_data="txt_to_xlsx")]
@@ -116,6 +115,140 @@ async def notify_owner_text(text):
         await app.send_message(chat_id=ADMIN_ID, text=text)
     except Exception as e:
         logging.error(f"notify_owner_text failed: {e}")
+
+# ---------------- FILE HELPERS ----------------
+def clean_lines(lines):
+    seen = set()
+    out = []
+    for line in lines:
+        s = line.strip()
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+def save_lines_to_txt(lines, path):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+def save_lines_to_xlsx(lines, path):
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    for i, v in enumerate(lines, start=1):
+        ws.cell(row=i, column=1, value=v)
+    wb.save(path)
+
+def xlsx_to_msg_list(path):
+    wb = openpyxl.load_workbook(path)
+    ws = wb.active
+    return [str(cell.value) for cell in ws['A'] if cell.value]
+
+# ---------------- COMMANDS ----------------
+@app.on_message(filters.command("start"))
+async def start(client: Client, message: Message):
+    uid = message.from_user.id
+    if not is_subscribed(uid) and not is_trial_allowed(uid):
+        await message.reply(unsub_msg())
+        return
+    user_sessions[uid] = {}
+    daily_stats["new_users"].add(uid)
+    await message.reply(
+        "👋 Welcome! Choose an option:" + CREDIT +
+        "\n\nCommands:\n"
+        "/start - Show this menu\n"
+        "/checksub - Check your subscription\n"
+        "/plans - Show subscription plans\n"
+        "/addsub - Admin add subscription\n"
+        "/extend - Admin extend subscription\n"
+        "/removesub - Admin remove subscription\n"
+        "/listsubs - Admin list all subscribers",
+        reply_markup=main_menu()
+    )
+
+@app.on_message(filters.command("checksub"))
+async def check_sub(client: Client, message: Message):
+    await message.reply(sub_status(message.from_user.id))
+
+@app.on_message(filters.command("plans"))
+async def plans(client: Client, message: Message):
+    await message.reply(unsub_msg())
+
+@app.on_message(filters.command("addsub") & filters.user(ADMIN_ID))
+async def add_sub_cmd(client: Client, message: Message):
+    try:
+        _, uid, days = message.text.split()
+        add_sub(int(uid), int(days))
+        await message.reply("✅ Subscription added." + CREDIT)
+    except:
+        await message.reply("❌ Usage: /addsub <user_id> <days>" + CREDIT)
+
+@app.on_message(filters.command("extend") & filters.user(ADMIN_ID))
+async def extend_sub_cmd(client: Client, message: Message):
+    try:
+        _, uid, days = message.text.split()
+        add_sub(int(uid), int(days))
+        await message.reply("✅ Subscription extended." + CREDIT)
+    except:
+        await message.reply("❌ Usage: /extend <user_id> <days>" + CREDIT)
+
+@app.on_message(filters.command("removesub") & filters.user(ADMIN_ID))
+async def remove_sub_cmd(client: Client, message: Message):
+    try:
+        _, uid = message.text.split()
+        remove_sub(int(uid))
+        await message.reply("🗑️ Subscription removed." + CREDIT)
+    except:
+        await message.reply("❌ Usage: /removesub <user_id>" + CREDIT)
+
+@app.on_message(filters.command("listsubs") & filters.user(ADMIN_ID))
+async def list_subs(client: Client, message: Message):
+    subs = load_subs()
+    if not subs:
+        return await message.reply("📭 No active subscriptions." + CREDIT)
+    msg = "👥 Active Subscribers:\n\n"
+    sorted_subs = sorted(subs.items(), key=lambda x: x[1]["expires"])
+    for uid, info in sorted_subs:
+        try:
+            user = await app.get_users(int(uid))
+            name = f"{user.first_name or ''} {user.last_name or ''}".strip()
+            username = f"@{user.username}" if user.username else ""
+        except:
+            name = "Unknown"
+            username = ""
+        msg += f"👤 {name} {username} ({uid}) | {info['plan']} | Expires: {info['expires']}\n"
+    msg += f"\n📊 Total Subscribers: {len(subs)}" + CREDIT
+    await message.reply(msg)
+
+# ---------------- CALLBACK HANDLER ----------------
+@app.on_callback_query()
+async def cb_handler(client, cq):
+    uid = cq.from_user.id
+    data = cq.data
+    if data == "back":
+        await cq.message.edit_text("👋 Main Menu:" + CREDIT, reply_markup=main_menu())
+        return
+
+    if not is_subscribed(uid) and not is_trial_allowed(uid):
+        await cq.message.edit_text(unsub_msg())
+        return
+
+    session = user_sessions.setdefault(uid, {})
+    session["last_action"] = data
+
+    if data == "split_txt":
+        await cq.message.edit_text("📤 Send me the TXT file to split." + CREDIT, reply_markup=back_btn())
+        daily_stats["features"]["split"] += 1
+    elif data == "xlsx_to_txt":
+        await cq.message.edit_text("📄 Send me the XLSX file to convert to TXT." + CREDIT, reply_markup=back_btn())
+        daily_stats["features"]["xlsx_txt"] += 1
+    elif data == "xlsx_to_msg":
+        await cq.message.edit_text("💬 Send me the XLSX file to convert to message list." + CREDIT, reply_markup=back_btn())
+        daily_stats["features"]["xlsx_msg"] += 1
+    elif data == "txt_to_xlsx":
+        await cq.message.edit_text("📊 Send me the TXT file to convert to XLSX." + CREDIT, reply_markup=back_btn())
+        daily_stats["features"]["txt_xlsx"] += 1
+    else:
+        await cq.answer("⚠️ Unknown action.")
 
 # ---------------- DAILY SUMMARY ----------------
 def daily_summary():
@@ -137,15 +270,13 @@ def daily_summary():
               f"📂 Files processed: {files_processed}\n\n" \
               f"🔥 Feature usage today:\n" \
               f"- Split TXT: {features['split']}\n" \
-              f"- Merge TXT: {features['merge']}\n" \
               f"- XLSX → TXT: {features['xlsx_txt']}\n" \
               f"- XLSX → Msg: {features['xlsx_msg']}\n" \
               f"- TXT → XLSX: {features['txt_xlsx']}\n\n" \
               f"⏳ Expiring Subscriptions:\n" + ("\n".join(expiring_subs) if expiring_subs else "None")
-    # send to admin
-    import asyncio
     asyncio.get_event_loop().create_task(notify_owner_text(summary))
-    # reset daily stats
+
+    # Reset daily stats
     daily_stats["new_users"].clear()
     daily_stats["files_processed"] = 0
     for k in daily_stats["features"]:
