@@ -20,7 +20,7 @@ SUB_FILE = os.getenv("SUB_FILE", "subscriptions.json")
 TRIAL_LIMIT = int(os.getenv("TRIAL_LIMIT", "2"))
 CREDIT = "\n\n🤖 Powered by @captainpapaji"
 FLASK_PORT = int(os.getenv("PORT", 8000))
-SESSION_NAME = "file_bot.session"
+SESSION_NAME = "file_bot_new.session"
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
